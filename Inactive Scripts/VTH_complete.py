@@ -56,11 +56,13 @@ while True:
 mechanism_choice = int(mechanism_choice)
 
 #Linear sweep voltammetry- defining a potential as a function of time
-def potential(x):
-    if x%(2*timescan)<timescan:
-            return LowerV + scanrate*(x% timescan)
-    else:
-            return UpperV - scanrate*((x - timescan) % timescan)
+def potential(x): return -0.1
+# =============================================================================
+#     if x%(2*timescan)<timescan:
+#             return LowerV + scanrate*(x% timescan)
+#     else:
+#             return UpperV - scanrate*((x - timescan) % timescan)
+# =============================================================================
 
 
 #Function to calculate U and Keq from theta, dG
@@ -162,6 +164,7 @@ curr1 = r0_vals[:, 0] * -F
 
 volmer_rate = r0_vals[:, 0]
 tafel_rate = r0_vals[:, 1]
+rH_vals = r0_vals[:, 2]
 
 '''assuming that tafel has an effect on the overall rate.  I wasn't sure about this.  If not, rate should just be volmer step'''
 t_rate = volmer_rate - tafel_rate
@@ -217,6 +220,28 @@ plt.title('Kinetic Current vs Potential')
 plt.grid()
 plt.show()
 
+plt.plot(t[1:], volmer_rate[1:])
+plt.xlabel('Time (s)')
+plt.ylabel('rV (mol/cm^2 s)')
+plt.title('rV vs Time')
+plt.grid()
+plt.show()
+    
+if mechanism_choice == 0:
+    plt.plot(t[1:], tafel_rate[1:])
+    plt.xlabel('Time (s)')
+    plt.ylabel('rT (mol/cm^2 s)')
+    plt.title('rT vs Time')
+    plt.grid()
+    plt.show()
+
+if mechanism_choice == 1:
+    plt.plot(t[1:], rH_vals[1:])
+    plt.xlabel('Time (s)')
+    plt.ylabel('rH (mol/cm^2 s)')
+    plt.title('rH vs Time')
+    plt.grid()
+    plt.show()
 
 #Create a dictionary to hold the data for excel file 
 data = {
