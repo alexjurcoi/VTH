@@ -126,6 +126,8 @@ partialPH2 = 1.0
 beta = [0.5, 0.5]
 V_app = -0.2
 k = 10
+r_tol = 1e-3
+a_tol = 1e-6
 
 k_V_RDS = 1e-10
 
@@ -307,8 +309,8 @@ if do_dynamic_ghad:
                     dthetadt = [theta_star_rate / cmax, theta_H_rate / cmax]
                 return dthetadt
 
-            soln = solve_ivp(sitebal, duration, theta0_dynamic,
-                             t_eval=t, max_step=maxstep, method='BDF')
+            soln = solve_ivp(sitebal, duration, theta0_dynamic, max_step = maxstep,
+                             t_eval=t, method='BDF')
             theta_at_t = soln.y  # shape: (2, len(t))
             thetaH_array = theta_at_t[1, :]
 
@@ -469,9 +471,7 @@ if do_static_volcano:
 
     GHad_eV_list = np.linspace(dGmin_eV, dGmax_eV, 16)
     GHad_J_list = GHad_eV_list * Avo * conversion_factor
-    
-    maxstep = 1
-    
+
     t_end = 5
     t_eval = np.linspace(0, t_end, 200)
 
@@ -554,8 +554,8 @@ if do_static_volcano:
                     thetaH_rate = (r_V - r_H) / cmax
                 return [thetaStar_rate, thetaH_rate]
 
-            soln = solve_ivp(sitebal_static, (0, t_end), theta0_static,
-                             t_eval=t_eval, method='BDF')
+            soln = solve_ivp(sitebal_static, (0, t_end), theta0_static, max_step = maxstep,
+                             t_eval=t_eval, method='BDF', atol = a_tol, rtol = r_tol)
 
             r0_vals = np.array([rates_r0_static(theta, GHad, mechanism_str)
                                 for theta in soln.y.T])
@@ -665,7 +665,7 @@ if do_static_volcano:
         plt.legend()
         plt.xlabel("GHad (eV)")
         plt.ylabel("Average $\\mathbf{r_T}$ (mol/cm²·s)")
-        plt.title(f"$\\mathbf{{r_T}}$ vs GHad, V = {V_app} V, \nmaxstep = {maxstep_VT:.2e} kT/kV = {k_T_base / k_V_RDS}")
+        plt.title(f"$\\mathbf{{r_T}}$ vs GHad, rtol = {r_tol}, atol = {a_tol} \nmaxstep = {maxstep_VT:.2e} kT/kV = {k_T_base / k_V_RDS}")
         ax = plt.gca()
         ax.xaxis.set_major_locator(MultipleLocator(0.05))
         plt.tight_layout()
@@ -720,7 +720,7 @@ if do_static_volcano:
             plt.legend()
             plt.xlabel("GHad (eV)")
             plt.ylabel("Average |Current Density| (mA/cm²)")
-            plt.title(f"Volcano Plot: Average Current vs GHad, \nV = {V_app} V (VT) kT/kV = {k_T_base / k_V_RDS}")
+            plt.title(f"Volcano Plot: Average Current vs GHad, \nrtol = {r_tol}, atol = {a_tol} (VT) kT/kV = {k_T_base / k_V_RDS}")
             ax = plt.gca()
             ax.xaxis.set_major_locator(MultipleLocator(0.05))
             plt.tight_layout()
@@ -783,7 +783,7 @@ if do_static_volcano:
         plt.legend()
         plt.xlabel("GHad (eV)")
         plt.ylabel("Average $\\mathbf{r_H}$ (mol/cm²·s)")
-        plt.title(f"$\\mathbf{{r_H}}$ vs GHad, V = {V_app} V, \nmaxstep = {maxstep_VH:.2e} kH/kV = {k_H_base / k_V_RDS}")
+        plt.title(f"$\\mathbf{{r_H}}$ vs GHad, rtol = {r_tol}, atol = {a_tol} \nmaxstep = {maxstep_VH:.2e} kH/kV = {k_H_base / k_V_RDS}")
         ax = plt.gca()
         ax.xaxis.set_major_locator(MultipleLocator(0.05))
         plt.tight_layout()
@@ -842,7 +842,7 @@ if do_static_volcano:
             plt.legend()
             plt.xlabel("GHad (eV)")
             plt.ylabel("Average |Current Density| (mA/cm²)")
-            plt.title(f"Volcano Plot: Average Current vs GHad, \nV = {V_app} V (VH) kH/kV = {k_H_base / k_V_RDS}")
+            plt.title(f"Volcano Plot: Average Current vs GHad, \nrtol = {r_tol}, atol = {a_tol} (VH) kH/kV = {k_H_base / k_V_RDS}")
             ax = plt.gca()
             ax.xaxis.set_major_locator(MultipleLocator(0.05))
             plt.tight_layout()
