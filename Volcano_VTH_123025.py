@@ -5,6 +5,10 @@ from scipy.integrate import solve_ivp
 from scipy.optimize import root_scalar
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
+from skopt import gp_minimize
+from skopt.space import Real
+from scipy.integrate import solve_ivp
+from scipy.interpolate import interp1d
 
 plt.rcParams.update({
     "font.size": 20,        # increase overall font size
@@ -176,7 +180,7 @@ if do_dynamic_ghad:
     print("\nRunning dynamic GHad(t) simulation...")
     # Time-varying GHad values (in J)
     dGmin = dGmin_dynamic * Avo * conversion_factor
-    dGmax = dGmax_dynamic * Avo * conversion_factor
+    dGmax = dGmax_dynamic * Avo * conversion_factor 
 
     for mechanism_choice in mechanisms_to_run:
         mech_label = MECH_LABEL[mechanism_choice]
@@ -209,10 +213,17 @@ if do_dynamic_ghad:
         avg_rH_dGmax = []
 
         dyn_results = []
+        
+        best_by_freq = {}
+
+        space = [
+            Real(0.00, 0.20, name='dGmin_eV'),
+            Real(0.01, 0.20, name='dGspan_eV'),
+            ]
 
         for freq in freq_array:
             print(f"\nRunning simulation with period = {freq:.2e} Hz...")
-
+            
             # time spacing
             t, max_time = make_t_eval(freq, n_cycles=20,
                                       coarse_pts_per_period=200,
@@ -224,10 +235,7 @@ if do_dynamic_ghad:
             P = 2.0 / freq
             maxstep = 1 / (freq * 1e2)
             print(f"Max Step: {maxstep:.2e}")
-
-            def dGvt(t):
-                return (dGmin) + (dGmax - dGmin) * (np.tanh(k * np.sin(2 * np.pi * freq * t)) + 1) / 2
-
+            
             # static potential
             def potential(t):
                 return V_app
@@ -243,202 +251,196 @@ if do_dynamic_ghad:
                     U_H = (GHad / F) + (RT * np.log(thetaA_H / thetaA_star) / F)
                 return U_V, U_H
 
-            # reduction is FORWARD, oxidation is REVERSE
-            def rates_r0(t, theta):
-                GHad = dGvt(t)
-                theta = np.asarray(theta)
-                thetaA_star, thetaA_H = theta
-                V = potential(t)
-                U_V, U_H = eqpot(theta, GHad)
-
-                # Volmer Rate Equation
-                r_V = k_V * (thetaA_star ** (1 - beta[0])) * (thetaA_H ** beta[0]) \
-                    * np.exp(beta[0] * GHad / RT) * (
-                        np.exp(-(beta[0]) * F * (V - U_V) / RT)
-                        - np.exp((1 - beta[0]) * F * (V - U_V) / RT))
-
-                r_T = 0.0
-                if mechanism_choice == 0:  # VT
-                    T_1 = (thetaA_H ** 2)
-                    T_2 = (partialPH2 * (thetaA_star ** 2)
-                           * np.exp((-2 * GHad) / RT))
-                    r_T = k_T * (T_1 - T_2)
-
-                r_H = 0.0
-                if mechanism_choice == 1:  # VH
-                    j1 = k_H * np.exp(-beta[1] * GHad / RT) * \
-                        thetaA_star ** beta[1] * \
-                        thetaA_H ** (1 - beta[1])
-                    exp21 = np.exp(-beta[1] * F * (V - U_H) / RT)
-                    exp22 = np.exp((1 - beta[1]) * F * (V - U_H) / RT)
-                    r_H = j1 * (exp21 - exp22)
-
-                return r_V, r_T, r_H
-
-            def theta_H_eq_dynamic(GHad_init, V, mech_choice):
-                # bracket for theta, solution should be between 1e-9 and 1 - 1e-9
-                lo, hi = 1e-9, 1 - 1e-9
-
-                def f(thetaH):
-                    theta = np.array([1 - thetaH, thetaH])
-                    rV, rT, rH = rates_r0(0, theta)
-                    if mech_choice == 0:
-                        return rV - 2 * rT
+            def objective_bounds(x):
+                dGmin_eV_cand = float(x[0])
+                dGspan_eV     = float(x[1])
+                dGmax_eV_cand = dGmin_eV_cand + dGspan_eV
+            
+                # enforce limits + ordering
+                if dGmax_eV_cand <= dGmin_eV_cand + 1e-6:
+                    return 0
+                if dGmax_eV_cand > 0.30:   # choose your physical max
+                    return 0
+                
+                dGmin_cand = dGmin_eV_cand * Avo * conversion_factor
+                dGmax_cand = dGmax_eV_cand * Avo * conversion_factor
+                
+                def dGvt_local(tt):
+                    return (dGmin_cand) + (dGmax_cand - dGmin_cand) * (np.tanh(k * np.sin(2 * np.pi * freq * tt)) + 1) / 2
+                
+                # reduction is FORWARD, oxidation is REVERSE
+                def rates_r0_local(tt, theta):
+                    GHad = dGvt_local(tt)
+                    theta = np.asarray(theta)
+                    thetaA_star, thetaA_H = theta
+                    V = potential(tt)
+                    U_V, U_H = eqpot(theta, GHad)
+    
+                    # Volmer Rate Equation
+                    r_V = k_V * (thetaA_star ** (1 - beta[0])) * (thetaA_H ** beta[0]) \
+                        * np.exp(beta[0] * GHad / RT) * (
+                            np.exp(-(beta[0]) * F * (V - U_V) / RT)
+                            - np.exp((1 - beta[0]) * F * (V - U_V) / RT))
+    
+                    r_T = 0.0
+                    if mechanism_choice == 0:  # VT
+                        T_1 = (thetaA_H ** 2)
+                        T_2 = (partialPH2 * (thetaA_star ** 2)
+                               * np.exp((-2 * GHad) / RT))
+                        r_T = k_T * (T_1 - T_2)
+    
+                    r_H = 0.0
+                    if mechanism_choice == 1:  # VH
+                        j1 = k_H * np.exp(-beta[1] * GHad / RT) * \
+                            thetaA_star ** beta[1] * \
+                            thetaA_H ** (1 - beta[1])
+                        exp21 = np.exp(-beta[1] * F * (V - U_H) / RT)
+                        exp22 = np.exp((1 - beta[1]) * F * (V - U_H) / RT)
+                        r_H = j1 * (exp21 - exp22)
+    
+                    return r_V, r_T, r_H
+    
+                def theta_H_eq_dynamic_local(GHad_init, V, mech_choice):
+                    # bracket for theta, solution should be between 1e-9 and 1 - 1e-9
+                    lo, hi = 1e-9, 1 - 1e-9
+    
+                    def f(thetaH):
+                        theta = np.array([1 - thetaH, thetaH])
+                        rV, rT, rH = rates_r0_local(0, theta)
+                        if mech_choice == 0:
+                            return rV - 2 * rT
+                        else:
+                            return rV - rH
+    
+                    sol = root_scalar(f, bracket=[lo, hi])
+                    return sol.root
+    
+                # Initial coverage of Hads, inside loop so that it starts fresh each time
+                thetaA_H0_dynamic = theta_H_eq_dynamic_local(dGmin, V_app, mechanism_choice)
+                thetaA_Star0_dynamic = 1.0 - thetaA_H0_dynamic  # Initial coverage of empty sites
+                theta0_dynamic = [thetaA_Star0_dynamic, thetaA_H0_dynamic]
+    
+                def sitebal_local(tt, theta):
+                    r_V, r_T, r_H = rates_r0_local(tt, theta)
+                    if mechanism_choice == 0:
+                        thetaStar_rate_VT = (-r_V + (2 * r_T)) / cmax
+                        thetaH_rate_VT = (r_V - (2 * r_T)) / cmax
+                        dthetadt = [thetaStar_rate_VT, thetaH_rate_VT]
                     else:
-                        return rV - rH
+                        theta_star_rate = r_H - r_V
+                        theta_H_rate = r_V - r_H
+                        dthetadt = [theta_star_rate / cmax, theta_H_rate / cmax]
+                    return dthetadt
+            
+            
+                thetaH0 = theta_H_eq_dynamic_local(dGmin_cand, V_app, mechanism_choice)
+                theta0  = [1-thetaH0, thetaH0]
 
-                sol = root_scalar(f, bracket=[lo, hi])
-                return sol.root
+                soln = solve_ivp(sitebal_local, duration, theta0_dynamic,
+                                     t_eval=t, max_step=maxstep, method='BDF')
+                if (not soln.success) or (soln.y.shape[1] != len(t)):
+                    return 0
 
-            # Initial coverage of Hads, inside loop so that it starts fresh each time
-            thetaA_H0_dynamic = theta_H_eq_dynamic(dGmin, V_app, mechanism_choice)
-            thetaA_Star0_dynamic = 1.0 - thetaA_H0_dynamic  # Initial coverage of empty sites
-            theta0_dynamic = [thetaA_Star0_dynamic, thetaA_H0_dynamic]
+                theta_at_t = soln.y  # shape: (2, len(t))
+                thetaH_array = theta_at_t[1, :]
 
-            def sitebal(t, theta):
-                r_V, r_T, r_H = rates_r0(t, theta)
-                if mechanism_choice == 0:
-                    thetaStar_rate_VT = (-r_V + (2 * r_T)) / cmax
-                    thetaH_rate_VT = (r_V - (2 * r_T)) / cmax
-                    dthetadt = [thetaStar_rate_VT, thetaH_rate_VT]
-                else:
-                    theta_star_rate = r_H - r_V
-                    theta_H_rate = r_V - r_H
-                    dthetadt = [theta_star_rate / cmax, theta_H_rate / cmax]
-                return dthetadt
+                GHad_t_J = np.array([dGvt_local(time) for time in t])
+                GHad_t_eV = GHad_t_J / (Avo * conversion_factor)
 
-            soln = solve_ivp(sitebal, duration, theta0_dynamic,
-                             t_eval=t, max_step=maxstep, method='BDF')
-            theta_at_t = soln.y  # shape: (2, len(t))
-            thetaH_array = theta_at_t[1, :]
+                r0_vals = np.array([rates_r0_local(time, theta)
+                                    for time, theta in zip(t, theta_at_t.T)])
+                r_V_vals = r0_vals[:, 0]
+                r_T_vals = r0_vals[:, 1]
+                r_H_vals = r0_vals[:, 2]
+                
+                ##########################################
+                metric = np.mean(np.abs(r_V_vals)) #key parameter, what is being optimized
+                ##########################################
+                curr_dynamic = r_V_vals * -F * 1000  # mA/cm²
 
-            GHad_t_J = np.array([dGvt(time) for time in t])
-            GHad_t_eV = GHad_t_J / (Avo * conversion_factor)
+                avg_curr = np.abs(np.average(curr_dynamic))
+                avg_currents.append(avg_curr)
 
-            r0_vals = np.array([rates_r0(time, theta)
-                                for time, theta in zip(t, theta_at_t.T)])
-            r_V_vals = r0_vals[:, 0]
-            r_T_vals = r0_vals[:, 1]
-            r_H_vals = r0_vals[:, 2]
+                avg_curr = np.abs(np.average(curr_dynamic))
+                avg_currents.append(avg_curr)
 
-            curr_dynamic = r_V_vals * -F * 1000  # mA/cm²
+                GHad_range = dGmax_cand - dGmin_cand
+                mask_min = (np.abs(GHad_t_J - dGmin_cand) < 0.2 * GHad_range)
+                mask_max = (np.abs(GHad_t_J - dGmax_cand) < 0.2 * GHad_range)
 
-            avg_curr = np.abs(np.average(curr_dynamic))
-            avg_currents.append(avg_curr)
 
-            GHad_range = dGmax - dGmin
-            mask_min = (np.abs(GHad_t_J - dGmin) < 0.2 * GHad_range)
-            mask_max = (np.abs(GHad_t_J - dGmax) < 0.2 * GHad_range)
+                average_rT_dGmin = np.average(r_T_vals[mask_min])
+                average_rT_dGmax = np.average(r_T_vals[mask_max])
+                average_rH_dGmin = np.average(r_H_vals[mask_min])
+                average_rH_dGmax = np.average(r_H_vals[mask_max])
 
-            average_rT_dGmin = np.average(r_T_vals[mask_min])
-            average_rT_dGmax = np.average(r_T_vals[mask_max])
-            average_rH_dGmin = np.average(r_H_vals[mask_min])
-            average_rH_dGmax = np.average(r_H_vals[mask_max])
+                print(f"Average rT at {dGmin}:", average_rT_dGmin)
+                print(f"Average rT at {dGmax}:", average_rT_dGmax)
+                print(f"Average rH at {dGmin}:", average_rH_dGmin)
+                print(f"Average rH at {dGmax}:", average_rH_dGmax)
 
-            print(f"Average rT at {dGmin}:", average_rT_dGmin)
-            print(f"Average rT at {dGmax}:", average_rT_dGmax)
-            print(f"Average rH at {dGmin}:", average_rH_dGmin)
-            print(f"Average rH at {dGmax}:", average_rH_dGmax)
+                avg_rT_dGmin.append(average_rT_dGmin)
+                avg_rT_dGmax.append(average_rT_dGmax)
+                avg_rH_dGmin.append(average_rH_dGmin)
+                avg_rH_dGmax.append(average_rH_dGmax)
 
-            avg_rT_dGmin.append(average_rT_dGmin)
-            avg_rT_dGmax.append(average_rT_dGmax)
-            avg_rH_dGmin.append(average_rH_dGmin)
-            avg_rH_dGmax.append(average_rH_dGmax)
+                # Absolute value of the current at GHad min/max
+                avg_curr_at_dGmin = np.average(np.abs(curr_dynamic[mask_min]))
+                avg_curr_at_dGmax = np.average(np.abs(curr_dynamic[mask_max]))
+                avg_currents_dGmin.append(avg_curr_at_dGmin)
+                avg_currents_dGmax.append(avg_curr_at_dGmax)
 
-            # Absolute value of the current at GHad min/max
-            avg_curr_at_dGmin = np.average(np.abs(curr_dynamic[mask_min]))
-            avg_curr_at_dGmax = np.average(np.abs(curr_dynamic[mask_max]))
-            avg_currents_dGmin.append(avg_curr_at_dGmin)
-            avg_currents_dGmax.append(avg_curr_at_dGmax)
+                # Save them for overlay plotting (per-frequency)
+                dynamic_overlay_points.append((dGmin_dynamic, avg_curr_at_dGmin))
+                dynamic_overlay_points.append((dGmax_dynamic, avg_curr_at_dGmax))
 
-            # Save them for overlay plotting (per-frequency)
-            dynamic_overlay_points.append((dGmin_dynamic, avg_curr_at_dGmin))
-            dynamic_overlay_points.append((dGmax_dynamic, avg_curr_at_dGmax))
+                dynamic_overlay_by_freq[freq] = [
+                    (dGmin_dynamic, float(average_rT_dGmin)),
+                    (dGmax_dynamic, float(average_rT_dGmax)),
+                ]
+                dynamic_overlay_by_freq1[freq] = [
+                    (dGmin_dynamic, float(avg_curr_at_dGmin)),
+                    (dGmax_dynamic, float(avg_curr_at_dGmax)),
+                ]
+                dynamic_overlay_by_freq_rH[freq] = [
+                    (dGmin_dynamic, float(average_rH_dGmin)),
+                    (dGmax_dynamic, float(average_rH_dGmax)),
+                ]
+                
+                dyn_results.append({
+                    "r_T": r_T_vals,
+                    "r_H": r_H_vals,
+                    "rV": r_V_vals,
+                    "period": 2 / (freq),
+                    "freq": float(freq),
+                    "t": t.copy(),
+                    "curr": curr_dynamic.copy(),
+                    "thetaH": thetaH_array.copy(),
+                    "GHad_eV": GHad_t_eV.copy(),
+                    "Average Current": avg_curr,
+                    "maxstep": maxstep,
+                })
+                
+                return -metric
+            res = gp_minimize(
+                objective_bounds, space,
+                n_calls=30, n_initial_points=10,
+                initial_point_generator="lhs",
+                acq_func="EI", random_state=0
+            )
+            
+            best_dGmin_eV, best_span_eV = res.x
+            best_dGmax_eV = best_dGmin_eV + best_span_eV
+            
+            best_metric = -res.fun  # because objective returns -metric
+            
+            best_by_freq[float(freq)] = {
+                "best_dGmin_eV": best_dGmin_eV,
+                "best_dGmax_eV": best_dGmax_eV,
+                "best_metric": best_metric,
+                "n_calls": len(res.func_vals),
+            }
 
-            dynamic_overlay_by_freq[freq] = [
-                (dGmin_dynamic, float(average_rT_dGmin)),
-                (dGmax_dynamic, float(average_rT_dGmax)),
-            ]
-            dynamic_overlay_by_freq1[freq] = [
-                (dGmin_dynamic, float(avg_curr_at_dGmin)),
-                (dGmax_dynamic, float(avg_curr_at_dGmax)),
-            ]
-            dynamic_overlay_by_freq_rH[freq] = [
-                (dGmin_dynamic, float(average_rH_dGmin)),
-                (dGmax_dynamic, float(average_rH_dGmax)),
-            ]
-
-            dyn_results.append({
-                "r_T": r_T_vals,
-                "r_H": r_H_vals,
-                "rV": r_V_vals,
-                "period": 2 / (freq),
-                "freq": float(freq),
-                "t": t.copy(),
-                "curr": curr_dynamic.copy(),
-                "thetaH": thetaH_array.copy(),
-                "GHad_eV": GHad_t_eV.copy(),
-                "Average Current": avg_curr,
-                "maxstep": maxstep,
-            })
-
-            # OPTIONAL time-domain plots (same as your original; keep or comment out)
-            P = 2.0 / freq
-            cycles_to_plot = 5
-            t_start = 0
-            t_end_plot = cycles_to_plot * P
-            mask = (t >= t_start) & (t <= t_end_plot)
-
-            average_rT = np.average(r_T_vals)
-            average_rH = np.average(r_H_vals)
-
-# =============================================================================
-#             if mechanism_choice == 0:
-#                 plt.figure(figsize=(8, 5))
-#                 plt.plot(t[mask], r_T_vals[mask], label=f"{freq:.2e} Hz", linewidth=1.8)
-#                 plt.axhline(y=average_rT, color="red", linestyle="--", linewidth=2,
-#                             label=f"Average rT = {average_rT:.2e}")
-#                 plt.xlabel("Time (s)")
-#                 plt.ylabel(r"$r_T$ (mol/cm²·s)")
-#                 plt.title(f"r_T vs Time at {freq:.2e} Hz, kV = {k_V}, maxstep = {maxstep:.2e}")
-#                 plt.legend()
-#                 plt.grid(True, alpha=0.3)
-#                 plt.tight_layout()
-#                 plt.show()
-# 
-#             if mechanism_choice == 1:
-#                 plt.figure(figsize=(8, 5))
-#                 plt.plot(t[mask], r_H_vals[mask], label=f"{freq:.2e} Hz", linewidth=1.8)
-#                 plt.axhline(y=average_rH, color="red", linestyle="--", linewidth=2,
-#                             label=f"Average rH = {average_rH:.2e}")
-#                 plt.xlabel("Time (s)")
-#                 plt.ylabel(r"$r_H$ (mol/cm²·s)")
-#                 plt.title(f"r_H vs Time at {freq:.2e} Hz, kV = {k_V}, maxstep = {maxstep:.2e}")
-#                 plt.legend()
-#                 plt.grid(True, alpha=0.3)
-#                 plt.tight_layout()
-#                 plt.show()
-# 
-#             # Coverage vs time
-#             plt.figure(figsize=(12, 10))
-#             plt.plot(t[mask], thetaH_array[mask], label=f'Theta_H Coverage ({freq:.2e} Hz)')
-#             plt.xlabel("Time (s)")
-#             plt.ylabel(r"$\theta_H$")
-#             plt.title(f'Coverage vs Time, {freq:.2e} Hz ({mech_label})')
-#             plt.grid(True, alpha=0.4)
-#             plt.legend()
-#             plt.show()
-# 
-#             # rV vs time
-#             plt.figure(figsize=(12, 10))
-#             plt.plot(t[mask], r_V_vals[mask], label=f'rV ({freq:.2e} Hz)')
-#             plt.xlabel("Time (s)")
-#             plt.ylabel(r"$r_V$")
-#             plt.title(f'rV vs Time, {freq:.2e} Hz ({mech_label})')
-#             plt.grid(True, alpha=0.4)
-#             plt.legend()
-#             plt.show()
-# =============================================================================
 
             # store last maxstep for this mechanism
             last_maxstep_per_mech[mech_label] = maxstep
@@ -448,6 +450,38 @@ if do_dynamic_ghad:
         overlay_storage[mech_label]["rT"] = dynamic_overlay_by_freq
         overlay_storage[mech_label]["rH"] = dynamic_overlay_by_freq_rH
         overlay_storage[mech_label]["curr"] = dynamic_overlay_by_freq1
+        
+        if best_by_freq:
+            freqs_sorted = sorted(best_by_freq.keys())
+        
+            dGmins = [best_by_freq[f]["best_dGmin_eV"] for f in freqs_sorted]
+            dGmaxs = [best_by_freq[f]["best_dGmax_eV"] for f in freqs_sorted]
+            bestM  = [best_by_freq[f]["best_metric"]   for f in freqs_sorted]
+        
+            # Plot 1: energies vs frequency
+            plt.figure(figsize=(10, 7))
+            plt.plot(freqs_sorted, dGmins, marker='o', label='Best dGmin (eV)')
+            plt.plot(freqs_sorted, dGmaxs, marker='o', label='Best dGmax (eV)')
+            plt.xscale("log")
+            plt.xlabel("Frequency (Hz)")
+            plt.ylabel("Binding energy (eV)")
+            plt.title(f"Best binding energies vs frequency ({mech_label})")
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
+        
+            # Plot 2: best metric vs frequency
+            plt.figure(figsize=(10, 7))
+            plt.plot(freqs_sorted, bestM, marker='o')
+            plt.xscale("log")
+            plt.xlabel("Frequency (Hz)")
+            plt.ylabel("Best mean(|rV|) (mol/cm²·s)")
+            plt.title(f"Best rV metric vs frequency ({mech_label})")
+            plt.grid(True)
+            plt.tight_layout()
+            plt.show()
+
 
 ###############################################################################
 # === STATIC VOLCANO PLOTS (VT & VH, with overlays)
