@@ -77,31 +77,15 @@ def make_output_filename(kV, kT, kH, freq_array=None, beta=None,
 
 ########################################  Time Function ###################################################
 
-def make_t_eval(freq, n_cycles=20,
-                coarse_pts_per_period=4,
-                halo_frac=0.05, max_eq_pts=500,
-                halo_points=40):
+def make_t_eval(freq, n_cycles=20, pts_per_freq = 100):
     P = 2.0 / float(freq)
     t_end = n_cycles * P
-    dt = P / float(coarse_pts_per_period)
-    # small epsilon to include t_end
-    t_coarse = np.arange(0, t_end + 1e-12, dt)
 
     # switching times
     switches = np.arange(n_cycles + 1) * P
     switches = np.clip(switches, 0.0, t_end)
 
-    # halos around switches
-    hw = halo_frac * P
-    halos_list = []
-    for tk in switches:
-        a = max(0.0, tk - hw)
-        b = min(t_end, tk + hw)
-        if b > a:
-            halos_list.append(np.linspace(a, b, halo_points))
-    halos = np.concatenate(halos_list) if halos_list else np.array([], dtype=float)
-
-    t_eval = np.unique(np.concatenate([t_coarse, switches, halos]))
+    t_eval = np.arange(0, t_end, freq / pts_per_freq)
     t_eval = t_eval[(t_eval >= 0.0) & (t_eval <= t_end)]
 
     # failsafe
@@ -126,15 +110,15 @@ Avo = 6.02e23     # 1/mol
 partialPH2 = 1.0
 beta = [0.5, 0.5]
 V_app = -0.4
-k = 10
+k = 95
 
 k_V_RDS = 1e-10
 
 # base kT and kH (for naming + magnitude)
-k_T_base = k_V_RDS * 100
-k_H_base = k_V_RDS * 100
+k_T_base = k_V_RDS * 20000
+k_H_base = k_V_RDS * 500                                                    
 
-freq_array = np.array(np.logspace(-9, 9, 41))
+freq_array = np.array(np.logspace(-12, 4, 41) / k_V_RDS)
 
 # dG values, static volcano
 dGmin_eV = 0.0  # eV
@@ -215,10 +199,7 @@ if do_dynamic_ghad:
             print(f"\nRunning simulation with period = {freq:.2e} Hz...")
 
             # time spacing
-            t, max_time = make_t_eval(freq, n_cycles=20,
-                                      coarse_pts_per_period=200,
-                                      halo_frac=0.10, max_eq_pts=500,
-                                      halo_points=100)
+            t, max_time = make_t_eval(freq, n_cycles=20, pts_per_freq = 100)
             duration = [0, max_time]
 
             # keep the solver from skipping over switch neighborhoods
@@ -393,53 +374,51 @@ if do_dynamic_ghad:
             average_rT = np.average(r_T_vals)
             average_rH = np.average(r_H_vals)
 
-# =============================================================================
-#             if mechanism_choice == 0:
-#                 plt.figure(figsize=(8, 5))
-#                 plt.plot(t[mask], r_T_vals[mask], label=f"{freq:.2e} Hz", linewidth=1.8)
-#                 plt.axhline(y=average_rT, color="red", linestyle="--", linewidth=2,
-#                             label=f"Average rT = {average_rT:.2e}")
-#                 plt.xlabel("Time (s)")
-#                 plt.ylabel(r"$r_T$ (mol/cm²·s)")
-#                 plt.title(f"r_T vs Time at {freq:.2e} Hz, kV = {k_V}, maxstep = {maxstep:.2e}")
-#                 plt.legend()
-#                 plt.grid(True, alpha=0.3)
-#                 plt.tight_layout()
-#                 plt.show()
-# 
-#             if mechanism_choice == 1:
-#                 plt.figure(figsize=(8, 5))
-#                 plt.plot(t[mask], r_H_vals[mask], label=f"{freq:.2e} Hz", linewidth=1.8)
-#                 plt.axhline(y=average_rH, color="red", linestyle="--", linewidth=2,
-#                             label=f"Average rH = {average_rH:.2e}")
-#                 plt.xlabel("Time (s)")
-#                 plt.ylabel(r"$r_H$ (mol/cm²·s)")
-#                 plt.title(f"r_H vs Time at {freq:.2e} Hz, kV = {k_V}, maxstep = {maxstep:.2e}")
-#                 plt.legend()
-#                 plt.grid(True, alpha=0.3)
-#                 plt.tight_layout()
-#                 plt.show()
-# 
-#             # Coverage vs time
-#             plt.figure(figsize=(12, 10))
-#             plt.plot(t[mask], thetaH_array[mask], label=f'Theta_H Coverage ({freq:.2e} Hz)')
-#             plt.xlabel("Time (s)")
-#             plt.ylabel(r"$\theta_H$")
-#             plt.title(f'Coverage vs Time, {freq:.2e} Hz ({mech_label})')
-#             plt.grid(True, alpha=0.4)
-#             plt.legend()
-#             plt.show()
-# 
-#             # rV vs time
-#             plt.figure(figsize=(12, 10))
-#             plt.plot(t[mask], r_V_vals[mask], label=f'rV ({freq:.2e} Hz)')
-#             plt.xlabel("Time (s)")
-#             plt.ylabel(r"$r_V$")
-#             plt.title(f'rV vs Time, {freq:.2e} Hz ({mech_label})')
-#             plt.grid(True, alpha=0.4)
-#             plt.legend()
-#             plt.show()
-# =============================================================================
+            if mechanism_choice == 0:
+                plt.figure(figsize=(8, 5))
+                plt.plot(t[mask], r_T_vals[mask], label=f"{freq:.2e} Hz", linewidth=1.8)
+                plt.axhline(y=average_rT, color="red", linestyle="--", linewidth=2,
+                            label=f"Average rT = {average_rT:.2e}")
+                plt.xlabel("Time (s)")
+                plt.ylabel(r"$r_T$ (mol/cm²·s)")
+                plt.title(f"r_T vs Time at {freq:.2e} Hz, kV = {k_V}, maxstep = {maxstep:.2e}")
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.show()
+
+            if mechanism_choice == 1:
+                plt.figure(figsize=(8, 5))
+                plt.plot(t[mask], r_H_vals[mask], label=f"{freq:.2e} Hz", linewidth=1.8)
+                plt.axhline(y=average_rH, color="red", linestyle="--", linewidth=2,
+                            label=f"Average rH = {average_rH:.2e}")
+                plt.xlabel("Time (s)")
+                plt.ylabel(r"$r_H$ (mol/cm²·s)")
+                plt.title(f"r_H vs Time at {freq:.2e} Hz, kV = {k_V}, maxstep = {maxstep:.2e}")
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.show()
+
+            # Coverage vs time
+            plt.figure(figsize=(12, 10))
+            plt.plot(t[mask], thetaH_array[mask], label=f'Theta_H Coverage ({freq:.2e} Hz)')
+            plt.xlabel("Time (s)")
+            plt.ylabel(r"$\theta_H$")
+            plt.title(f'Coverage vs Time, {freq:.2e} Hz ({mech_label})')
+            plt.grid(True, alpha=0.4)
+            plt.legend()
+            plt.show()
+
+            # rV vs time
+            plt.figure(figsize=(12, 10))
+            plt.plot(t[mask], r_V_vals[mask], label=f'rV ({freq:.2e} Hz)')
+            plt.xlabel("Time (s)")
+            plt.ylabel(r"$r_V$")
+            plt.title(f'rV vs Time, {freq:.2e} Hz ({mech_label})')
+            plt.grid(True, alpha=0.4)
+            plt.legend()
+            plt.show()
 
             # store last maxstep for this mechanism
             last_maxstep_per_mech[mech_label] = maxstep

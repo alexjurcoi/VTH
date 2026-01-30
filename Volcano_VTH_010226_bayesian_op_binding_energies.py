@@ -353,7 +353,7 @@ if do_dynamic_ghad:
 
                 try:
                     soln = solve_ivp(sitebal_local, duration, theta0,
-                                     t_eval=t, max_step=maxstep, method='BDF')
+                                     t_eval=t, max_step=maxstep, method='BDF', atol = 1e-12)
                 except FloatingPointError:
                     return PENALTY
 
@@ -666,7 +666,7 @@ if do_dynamic_ghad:
 
                 try:
                     soln = solve_ivp(sitebal_local, duration, theta0,
-                                     t_eval=t, max_step=maxstep, method='BDF')
+                                     t_eval=t, max_step=maxstep, method='BDF', atol = 1e-12)
                 except FloatingPointError:
                     return PENALTY
 
@@ -960,7 +960,7 @@ if do_static_volcano:
                 return [thetaStar_rate, thetaH_rate]
 
             soln = solve_ivp(sitebal_static, (0, t_end), theta0_static,
-                             t_eval=t_eval, method='BDF')
+                             t_eval=t_eval, method='BDF', atol=1e-12)
 
             r0_vals = np.array([rates_r0_static(theta, GHad, mechanism_str)
                                 for theta in soln.y.T])

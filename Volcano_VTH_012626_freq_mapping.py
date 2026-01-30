@@ -1,0 +1,1205 @@
+import numpy as np
+import os
+import pandas as pd
+from scipy.integrate import solve_ivp
+from scipy.optimize import root_scalar
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
+from matplotlib.ticker import LogLocator, LogFormatterSciNotation
+
+plt.rcParams.update({
+    "font.size": 20,        # increase overall font size
+    "axes.labelsize": 20,   # bigger axis labels
+    "axes.labelweight": "bold",
+    "axes.titlesize": 24,   # bigger title
+    "axes.titleweight": "bold",
+    "legend.fontsize": 16,  # legend text size
+    "xtick.labelsize": 20,
+    "ytick.labelsize": 20,
+})
+
+###############################################################################
+# MECHANISM MODE SELECTION (0=VT, 1=VH, 2=BOTH)
+###############################################################################
+
+while True:
+    mech_mode = input(
+        "Run which mechanism(s)?\n"
+        f"{'Volmer RDS Tafel Fast (VT only) [0]'.rjust(40)}\n"
+        f"{'Volmer RDS Heyrovsky Fast (VH only) [1]'.rjust(40)}\n"
+        f"{'Both VT and VH [2]'.rjust(40)}\n"
+        "Enter 0, 1, or 2: "
+    ).strip()
+    if mech_mode in ["0", "1", "2"]:
+        mech_mode = int(mech_mode)
+        break
+    print("Invalid choice. Please enter 0, 1, or 2.")
+
+MECH_LABEL = {0: "VT", 1: "VH"}
+if mech_mode == 0:
+    mechanisms_to_run = [0]       # VT only
+elif mech_mode == 1:
+    mechanisms_to_run = [1]       # VH only
+else:
+    mechanisms_to_run = [0, 1]    # BOTH
+
+###############################################################################
+# FILE NAMING FUNCTION (kV, kT, kH always in filename)
+###############################################################################
+
+def make_output_filename(kV, kT, kH, freq_phys=None, beta=None,
+                         dGmin=None, dGmax=None, voltage=None,
+                         t_switching=None,
+                         base="dynamic_simulation_output.xlsx"):
+    """
+    Build a unique filename string with parameters included.
+    kV, kT, kH always appear in the filename, regardless of mechanism.
+    """
+    freq_str = "-".join([f"{f:.1e}" for f in (freq_phys or [])])
+    k_str = f"kV={kV:.2e}_kT={kT:.2e}_kH={kH:.2e}"
+
+    if beta is not None:
+        beta_str = "__".join([f"{b:.3f}" for b in beta])
+    else:
+        beta_str = "NA"
+
+    filename = (
+        f"sim_k_{k_str}_freq_{freq_str}_beta_{beta_str}"
+        f"_dG_{dGmin:.2f}-{dGmax:.2f}eV_V_{voltage:.2f}_tswitching{t_switching}.xlsx"
+    )
+
+    final_filename = filename
+    counter = 1
+    while os.path.exists(final_filename):
+        final_filename = filename.replace(".xlsx", f"_{counter}.xlsx")
+        counter += 1
+    return final_filename
+
+########################################  Time Function ###################################################
+
+def make_t_eval(freq, n_cycles=20, pts_per_freq = 100):
+    P = 1.0 / float(freq)
+    t_end = n_cycles * P
+    dt = P / pts_per_freq
+    t_eval = np.arange(0, t_end + dt, dt) 
+    t_eval = t_eval[(t_eval >= 0.0) & (t_eval <= t_end)]
+
+    # failsafe
+    if t_eval.size == 0 or t_eval[0] > 0.0:
+        t_eval = np.insert(t_eval, 0, 0.0)
+    if t_eval[-1] < t_end:
+        t_eval = np.append(t_eval, t_end)
+
+    return t_eval, t_end
+
+###########################################################################################################################
+###########################################################################################################################
+####################################################### PARAMETERS ########################################################
+###########################################################################################################################
+###########################################################################################################################
+
+RT = 8.314 * 298  # J/mol
+F = 96485.0       # C/mol
+cmax = 7.5e-9 * 10     # sites/cm²
+conversion_factor = 1.60218e-19  # eV to J
+Avo = 6.02e23     # 1/mol
+partialPH2 = 1.0
+beta = [0.5, 0.5]
+V_app = -0.1
+k = 95
+a_tol = 1e-14
+r_tol = 1e-8
+phi = -3*np.pi/2
+duty = 0.2   #0.5 is 50/50 split, 0.1 -> majority dGmin | 0.9 -> majority dGmax
+
+k_V_RDS = 1e-10
+
+# base kT and kH (for naming + magnitude)
+k_T_base = k_V_RDS * 20000
+k_H_base = k_V_RDS * 500
+
+freq_phys = np.array(np.logspace(-4, 10, 19))
+freq_norm = freq_phys / (k_V_RDS / cmax)
+
+# dG values, static volcano
+dGmin_eV = -0.1  # eV
+dGmax_eV = 0.2   # eV
+
+# dG values, dynamic
+dGmin_dynamic = 0.05  # eV
+dGmax_dynamic = 0.15  # eV
+
+# === Prompt User ===
+print("Choose which simulations to run:")
+do_static_volcano = input("Run static volcano plot? (y/n): ").strip().lower() == 'y'
+do_dynamic_ghad = input("Run dynamic GHad(t) simulation? (y/n): ").strip().lower() == 'y'
+
+###############################################################################
+# STORAGE FOR ALL MECHANISMS
+###############################################################################
+
+avg_rV_freq = []
+avg_rT_freq = []
+avg_rH_freq = []
+
+# Dynamic results per mechanism (for Excel)
+dyn_results_all = {"VT": [], "VH": []}
+
+# Dynamic overlay storage per mechanism (for volcano plots)
+overlay_storage = {
+    "VT": {"rT": {}, "rH": {}, "rV": {}, "avg": {}},
+    "VH": {"rT": {}, "rH": {}, "rV": {}, "avg": {}},
+}
+
+# For static volcano summary
+static_summary_rows = []  # will hold dicts with mechanism, GHad, avg_rT/r_H, current
+
+# Remember last maxstep per mechanism for titles
+last_maxstep_per_mech = {"VT": None, "VH": None}
+
+###############################################################################
+# === DYNAMIC GHad(t) SIMULATION ===
+###############################################################################
+
+if do_dynamic_ghad:
+
+    print("\nRunning dynamic GHad(t) simulation...")
+
+    # =========================
+    # dGmin/dGmax sweep settings
+    # =========================
+    dG_lo, dG_hi, dG_step = -0.10, 0.40, 0.01
+    dG_vals = np.round(np.arange(dG_lo, dG_hi + 1e-12, dG_step), 2)
+    n_dG = len(dG_vals)
+    
+    # heatmaps[mech_label][freq] = Z matrix
+    heatmaps = {"VT": {}, "VH": {}}
+    
+    # Time-varying GHad values (in J)
+    dGmin = dGmin_dynamic * Avo * conversion_factor
+    dGmax = dGmax_dynamic * Avo * conversion_factor
+
+    for mechanism_choice in mechanisms_to_run:
+        mech_label = MECH_LABEL[mechanism_choice]
+        print(f"\n=== DYNAMIC SIMULATION FOR {mech_label} ===")
+
+        # Set mechanism-specific rate constants (Option 1)
+        if mechanism_choice == 0:   # VT
+            k_V = k_V_RDS
+            k_T = k_T_base
+            k_H = 0.0
+        else:                       # VH
+            k_V = k_V_RDS
+            k_T = 0.0
+            k_H = k_H_base
+
+        # These match your original script naming / structure
+        dynamic_overlay_points = []
+        dynamic_overlay_by_freq = {}    # r_T overlay
+        dynamic_overlay_by_freq1 = {}   # current overlay
+        dynamic_overlay_by_freq_rH = {} # r_H overlay
+
+        avg_currents = []
+
+        # Lists per frequency
+        avg_currents_dGmin = []
+        avg_currents_dGmax = []
+        avg_rV_dGmin = []
+        avg_rV_dGmax = []
+        avg_rT_dGmin = []
+        avg_rT_dGmax = []
+        avg_rH_dGmin = []
+        avg_rH_dGmax = []
+
+        dyn_results = []
+        
+        
+        vh_trace_store = {}
+
+
+        for freq in freq_phys:
+            print(f"\nRunning simulation with period = {freq:.2e} Hz...")
+
+            # time spacing
+            t, max_time = make_t_eval(freq, n_cycles=100, pts_per_freq=200)            
+            duration = [0, max_time]
+
+            # keep the solver from skipping over switch neighborhoods
+            P = 1.0 / freq
+            maxstep = 1 / (freq * 1e3)
+            print(f"Max Step: {maxstep:.2e}")
+
+            def dGvt(t):
+                return (dGmin) + (dGmax - dGmin) * (np.tanh(k * (np.sin(2*np.pi * freq * t - phi) - np.sin(np.pi * (0.5 - duty)))) + 1) / 2
+
+            # static potential
+            def potential(t):
+                return V_app
+
+            # equilibrium potentials
+            def eqpot(theta, GHad):
+                theta = np.asarray(theta)
+                thetaA_star, thetaA_H = theta  # unpack surface coverage
+
+                U_V = (-GHad / F) + (RT * np.log(thetaA_star / thetaA_H)) / F
+                U_H = 0.0
+                if mechanism_choice == 1:  # VH
+                    U_H = (GHad / F) + (RT * np.log(thetaA_H / thetaA_star) / F)
+                return U_V, U_H
+
+            # reduction is FORWARD, oxidation is REVERSE
+            def rates_r0(t, theta):
+                GHad = dGvt(t)
+                theta = np.asarray(theta)
+                thetaA_star, thetaA_H = theta
+                V = potential(t)
+                U_V, U_H = eqpot(theta, GHad)
+                
+                if (thetaA_star <= 0) or (thetaA_H <= 0) or (thetaA_star >= 1) or (thetaA_H >= 1) or (not np.isfinite(thetaA_star)) or (not np.isfinite(thetaA_H)):
+                    raise RuntimeError(f"Bad theta at t={t:.3e}: theta*={thetaA_star}, thetaH={thetaA_H}")
+
+                # Volmer Rate Equation
+                r_V = k_V * (thetaA_star ** (1 - beta[0])) * (thetaA_H ** beta[0]) \
+                    * np.exp(beta[0] * GHad / RT) * (
+                        np.exp(-(beta[0]) * F * (V - U_V) / RT)
+                        - np.exp((1 - beta[0]) * F * (V - U_V) / RT))
+
+                r_T = 0.0
+                if mechanism_choice == 0:  # VT
+                    T_1 = (thetaA_H ** 2)
+                    T_2 = (partialPH2 * (thetaA_star ** 2)
+                           * np.exp((-2 * GHad) / RT))
+                    r_T = k_T * (T_1 - T_2)
+
+                r_H = 0.0
+                if mechanism_choice == 1:  # VH
+                    j1 = k_H * np.exp(-beta[1] * GHad / RT) * \
+                        thetaA_star ** beta[1] * \
+                        thetaA_H ** (1 - beta[1])
+                    exp21 = np.exp(-beta[1] * F * (V - U_H) / RT)
+                    exp22 = np.exp((1 - beta[1]) * F * (V - U_H) / RT)
+                    r_H = j1 * (exp21 - exp22)
+
+                return r_V, r_T, r_H
+
+            def theta_H_eq_dynamic(GHad_init, V, mech_choice):
+                # bracket for theta, solution should be between 1e-9 and 1 - 1e-9
+                lo, hi = 1e-9, 1 - 1e-9
+
+                def f(thetaH):
+                    theta = np.array([1 - thetaH, thetaH])
+                    rV, rT, rH = rates_r0(0, theta)
+                    if mech_choice == 0:
+                        return rV - 2 * rT
+                    else:
+                        return rV - rH
+
+                sol = root_scalar(f, bracket=[lo, hi])
+                return sol.root
+                        
+            # Initial coverage of Hads, inside loop so that it starts fresh each time
+            thetaA_H0_dynamic = theta_H_eq_dynamic(dGvt(0), V_app, mechanism_choice)
+            thetaA_Star0_dynamic = 1.0 - thetaA_H0_dynamic  # Initial coverage of empty sites
+            theta0_dynamic = [thetaA_Star0_dynamic, thetaA_H0_dynamic]
+
+            def sitebal(t, theta):
+                r_V, r_T, r_H = rates_r0(t, theta)
+                if mechanism_choice == 0:
+                    thetaStar_rate_VT = (-r_V + (2 * r_T)) / cmax
+                    thetaH_rate_VT = (r_V - (2 * r_T)) / cmax
+                    dthetadt = [thetaStar_rate_VT, thetaH_rate_VT]
+                else:
+                    theta_star_rate = r_H - r_V
+                    theta_H_rate = r_V - r_H
+                    dthetadt = [theta_star_rate / cmax, theta_H_rate / cmax]
+                return dthetadt
+
+            soln = solve_ivp(sitebal, duration, theta0_dynamic,
+                             t_eval=t, max_step=maxstep, method='BDF', atol = a_tol, rtol = r_tol)
+            theta_at_t = soln.y  # shape: (2, len(t))
+            thetaH_array = theta_at_t[1, :]
+
+            GHad_t_J = np.array([dGvt(time) for time in t])
+            GHad_t_eV = GHad_t_J / (Avo * conversion_factor)
+
+            r0_vals = np.array([rates_r0(time, theta)
+                                for time, theta in zip(t, theta_at_t.T)])
+            r_V_vals = r0_vals[:, 0]
+            r_T_vals = r0_vals[:, 1]
+            r_H_vals = r0_vals[:, 2]
+
+            curr_dynamic = r_V_vals * -F * 1000  # mA/cm²
+
+            avg_curr = np.abs(np.average(curr_dynamic))
+            avg_currents.append(avg_curr)
+
+            GHad_range = dGmax - dGmin
+            mask_min = (np.abs(GHad_t_J - dGmin) < 0.2 * GHad_range)
+            mask_max = (np.abs(GHad_t_J - dGmax) < 0.2 * GHad_range)
+
+            average_rT_dGmin = np.average(r_T_vals[mask_min])
+            average_rT_dGmax = np.average(r_T_vals[mask_max])
+            average_rH_dGmin = np.average(r_H_vals[mask_min])
+            average_rH_dGmax = np.average(r_H_vals[mask_max])
+
+            print(f"Average rT at {dGmin}:", average_rT_dGmin)
+            print(f"Average rT at {dGmax}:", average_rT_dGmax)
+            print(f"Average rH at {dGmin}:", average_rH_dGmin)
+            print(f"Average rH at {dGmax}:", average_rH_dGmax)
+
+            avg_rT_dGmin.append(average_rT_dGmin)
+            avg_rT_dGmax.append(average_rT_dGmax)
+            avg_rH_dGmin.append(average_rH_dGmin)
+            avg_rH_dGmax.append(average_rH_dGmax)
+
+            # Absolute value of rV at GHad min/max
+            avg_rV_at_dGmin = np.average(r_V_vals[mask_min])
+            avg_rV_at_dGmax = np.average(r_V_vals[mask_max])
+            avg_rV_dGmin.append(avg_rV_at_dGmin)
+            avg_rV_dGmax.append(avg_rV_at_dGmax)
+
+            # Save them for overlay plotting (per-frequency)
+            dynamic_overlay_points.append((dGmin_dynamic, avg_rV_at_dGmin))
+            dynamic_overlay_points.append((dGmax_dynamic, avg_rV_at_dGmax))
+
+            dynamic_overlay_by_freq[freq] = [
+                (dGmin_dynamic, float(average_rT_dGmin)),
+                (dGmax_dynamic, float(average_rT_dGmax)),
+            ]
+            dynamic_overlay_by_freq1[freq] = [
+                (dGmin_dynamic, float(avg_rV_at_dGmin)),
+                (dGmax_dynamic, float(avg_rV_at_dGmax)),
+            ]
+            dynamic_overlay_by_freq_rH[freq] = [
+                (dGmin_dynamic, float(average_rH_dGmin)),
+                (dGmax_dynamic, float(average_rH_dGmax)),
+            ]
+
+            dyn_results.append({
+                "r_T": r_T_vals,
+                "r_H": r_H_vals,
+                "rV": r_V_vals,
+                "period": 1 / (freq),
+                "freq": float(freq),
+                "t": t.copy(),
+                "curr": curr_dynamic.copy(),
+                "thetaH": thetaH_array.copy(),
+                "GHad_eV": GHad_t_eV.copy(),
+                "Average Current": avg_curr,
+                "maxstep": maxstep,
+            })
+
+            
+            #######################################################################
+            # HOW TO USE IT IN *YOUR* SCRIPT
+            #######################################################################
+            # 1) Add a dict to store per-frequency traces for VH (inside dynamic section)
+            #    e.g. before the for freq in freq_phys loop:
+            #
+            # vh_trace_store = {}
+            #
+            # 2) After you compute r_V_vals, theta_at_t, GHad_t_J, GHad_t_eV in the VH loop,
+            #    store them:
+            #
+            # if mech_label == "VH":
+            #     vh_trace_store[freq] = {
+            #         "t": t.copy(),
+            #         "theta_at_t": theta_at_t.copy(),   # (2,N)
+            #         "GHad_J": GHad_t_J.copy(),
+            #         "GHad_eV": GHad_t_eV.copy(),
+            #         "rV": r_V_vals.copy(),
+            #         "RT": RT,
+            #         "F": F,
+            #     }
+            #
+            # 3) After the dynamic simulation finishes (after loops), call:
+            #
+            # plot_regime_diagnostics(vh_trace_store, list(vh_trace_store.keys()),
+            #                         title_prefix="VH: G(t) vs θH(t) → ηV(t) → rV(t)",
+            #                         n_cycles_plot=5, V_app=V_app)
+            #
+            #######################################################################
+
+            
+            
+            # OPTIONAL time-domain plots (same as your original; keep or comment out)
+            P = 1.0 / freq
+            cycles_to_plot_binding = 5
+            cycles_to_plot_coverage = 5
+            t_start = 0
+            t_end_plot = cycles_to_plot_coverage * P
+            t_end_binding = cycles_to_plot_binding * P
+            mask = (t >= t_start) & (t <= t_end_plot)
+            mask_binding = (t >= t_start) & (t <= t_end_binding)
+
+            average_rT_dynamic = np.average(r_T_vals)
+            average_rH_dynamic = np.average(r_H_vals)
+            average_rV_dynamic = np.average(r_V_vals)
+            
+# =============================================================================
+#             # Binding Energy vs time
+#             plt.figure(figsize=(12, 10))
+#             plt.plot(t[mask_binding], GHad_t_eV[mask_binding], label=f'Theta_H Coverage ({freq:.2e} Hz)')
+#             plt.xlabel("Time (s)")
+#             plt.ylabel(r"Binding Energy, eV")
+#             plt.title(f'Binding Energy vs Time, {freq:.2e} Hz ({mech_label}), phi={phi:.2f}')
+#             plt.grid(True, alpha=0.4)
+#             plt.legend()
+#             plt.show()
+#             
+#             # Coverage vs time
+#             plt.figure(figsize=(12, 10))
+#             plt.plot(t[mask], thetaH_array[mask], label=f'Theta_H Coverage ({freq:.2e} Hz)')
+#             plt.xlabel("Time (s)")
+#             plt.ylabel(r"$\theta_H$")
+#             plt.title(f'Coverage vs Time, {freq:.2e} Hz ({mech_label}), phi={phi:.2f}')
+#             plt.grid(True, alpha=0.4)
+#             plt.legend()
+#             plt.show()
+# =============================================================================
+
+# ================================================ =============================
+#             if mechanism_choice == 0:
+#                 plt.figure(figsize=(8, 5))
+#                 plt.plot(t[mask], r_T_vals[mask], label=f"{freq:.2e} Hz", linewidth=1.8)
+#                 plt.axhline(y=average_rT, color="red", linestyle="--", linewidth=2,
+#                             label=f"Average rT = {average_rT:.2e}")
+#                 plt.xlabel("Time (s)")
+#                 plt.ylabel(r"$r_T$ (mol/cm²·s)")
+#                 plt.title(f"r_T vs Time at {freq:.2e} Hz, kV = {k_V}, maxstep = {maxstep:.2e}")
+#                 plt.legend()
+#                 plt.grid(True, alpha=0.3)
+#                 plt.tight_layout()
+#                 plt.show()
+# 
+#             if mechanism_choice == 1:
+#                 plt.figure(figsize=(8, 5))
+#                 plt.plot(t[mask], r_H_vals[mask], label=f"{freq:.2e} Hz", linewidth=1.8)
+#                 plt.axhline(y=average_rH, color="red", linestyle="--", linewidth=2,
+#                             label=f"Average rH = {average_rH:.2e}")
+#                 plt.xlabel("Time (s)")
+#                 plt.ylabel(r"$r_H$ (mol/cm²·s)")
+#                 plt.title(f"r_H vs Time at {freq:.2e} Hz, kV = {k_V}, maxstep = {maxstep:.2e}")
+#                 plt.legend()
+#                 plt.grid(True, alpha=0.3)
+#                 plt.tight_layout()
+#                 plt.show()
+# 
+#             # Coverage vs time
+#             plt.figure(figsize=(12, 10))
+#             plt.plot(t[mask], thetaH_array[mask], label=f'Theta_H Coverage ({freq:.2e} Hz)')
+#             plt.xlabel("Time (s)")
+#             plt.ylabel(r"$\theta_H$")
+#             plt.title(f'Coverage vs Time, {freq:.2e} Hz ({mech_label})')
+#             plt.grid(True, alpha=0.4)
+#             plt.legend()
+#             plt.show()
+# 
+#             # rV vs time
+#             plt.figure(figsize=(12, 10))
+#             plt.plot(t[mask], r_V_vals[mask], label=f'rV ({freq:.2e} Hz)')
+#             plt.xlabel("Time (s)")
+#             plt.ylabel(r"$r_V$")
+#             plt.title(f'rV vs Time, {freq:.2e} Hz ({mech_label})')
+#             plt.grid(True, alpha=0.4)
+#             plt.legend()
+#             plt.show()
+# =============================================================================
+
+            # store last maxstep for this mechanism
+            last_maxstep_per_mech[mech_label] = maxstep
+        
+            overlay_storage[mech_label]["avg"][freq] = {
+                "average_rV": average_rV_dynamic,
+                "average_rT": average_rT_dynamic,
+                "average_rH": average_rH_dynamic,
+            }
+
+        # save dynamic results & overlays for this mechanism
+        dyn_results_all[mech_label] = dyn_results
+        overlay_storage[mech_label]["rT"] = dynamic_overlay_by_freq
+        overlay_storage[mech_label]["rH"] = dynamic_overlay_by_freq_rH
+        overlay_storage[mech_label]["rV"] = dynamic_overlay_by_freq1
+
+###############################################################################
+# === STATIC VOLCANO PLOTS (VT & VH, with overlays)
+###############################################################################
+
+# We will store per-mechanism static volcano data
+static_results_VT_rT = []   # (GHad_eV, avg_rT)
+static_results_VT_rV = [] # (GHad_eV, avg_rV)
+static_results_VH_rH = []   # (GHad_eV, avg_rH)
+static_results_VH_rV = [] # (GHad_eV, avg_rV)
+max_static_VH_rH = None
+max_static_VT_rT = None
+max_static_VH_rV = None
+max_static_VT_rV = None
+
+if do_static_volcano:
+
+    print("\nRunning static volcano plot...\n")
+
+    GHad_eV_list = np.linspace(dGmin_eV, dGmax_eV, 16)
+    GHad_J_list = GHad_eV_list * Avo * conversion_factor
+    
+    maxstep = 1
+    
+    t_end = 5
+    t_eval = np.linspace(0, t_end, 200)
+
+    for mechanism_choice in mechanisms_to_run:
+        mech_label = MECH_LABEL[mechanism_choice]
+        print(f"=== STATIC VOLCANO FOR {mech_label} ===")
+
+        # set k's like in dynamic
+        if mechanism_choice == 0:   # VT
+            k_V = k_V_RDS
+            k_T = k_T_base
+            k_H = 0.0
+        else:                       # VH
+            k_V = k_V_RDS
+            k_T = 0.0
+            k_H = k_H_base
+
+        # Shared static rate expression (depends on mechanism)
+        def rates_r0_static(theta, GHad, mechanism):
+            theta = np.asarray(theta)
+            thetaA_star, thetaA_H = theta
+
+            U_V = (-GHad / F) + (RT * np.log(thetaA_star / thetaA_H)) / F
+
+            # Volmer
+            r_V = k_V * (thetaA_star ** (1 - beta[0])) * (thetaA_H ** beta[0]) \
+                * np.exp(beta[0] * GHad / RT) * (
+                    np.exp(-(beta[0]) * F * (V_app - U_V) / RT)
+                    - np.exp((1 - beta[0]) * F * (V_app - U_V) / RT))
+
+            if mechanism == "VT":
+                r_T = k_T * ((thetaA_H ** 2) -
+                             partialPH2 * (thetaA_star ** 2) * np.exp((-2 * GHad) / RT))
+                r_H = 0.0
+            else:  # VH
+                U_H = (GHad / F) + (RT / F) * np.log(thetaA_H / thetaA_star)
+                j1 = k_H * np.exp(-beta[1] * GHad / RT) \
+                    * thetaA_star ** beta[1] * thetaA_H ** (1 - beta[1])
+                r_H = j1 * (
+                    np.exp(-beta[1] * F * (V_app - U_H) / RT)
+                    - np.exp((1 - beta[1]) * F * (V_app - U_H) / RT)
+                )
+                r_T = 0.0
+
+            return r_V, r_T, r_H
+
+        # equilibrium theta for static
+        def theta_H_eq_static(GHad, mechanism):
+            lo, hi = 1e-9, 1 - 1e-9
+
+            def f(thetaH):
+                theta = np.array([1 - thetaH, thetaH])
+                rV, rT, rH = rates_r0_static(theta, GHad, mechanism)
+                if mechanism == "VT":
+                    return rV - 2 * rT
+                else:
+                    return rV - rH
+
+            sol = root_scalar(f, bracket=[lo, hi])
+            return sol.root
+
+        for GHad, GHad_eV in zip(GHad_J_list, GHad_eV_list):
+
+            if mech_label == "VT":
+                mechanism_str = "VT"
+            else:
+                mechanism_str = "VH"
+
+            thetaA_H0_static = theta_H_eq_static(GHad, mechanism_str)
+            thetaA_Star0_static = 1.0 - thetaA_H0_static
+            theta0_static = [thetaA_Star0_static, thetaA_H0_static]
+
+            def sitebal_static(t_static, theta):
+                r_V, r_T, r_H = rates_r0_static(theta, GHad, mechanism_str)
+                if mechanism_str == "VT":
+                    thetaStar_rate = (-r_V + (2 * r_T)) / cmax
+                    thetaH_rate = (r_V - (2 * r_T)) / cmax
+                else:
+                    thetaStar_rate = (r_H - r_V) / cmax
+                    thetaH_rate = (r_V - r_H) / cmax
+                return [thetaStar_rate, thetaH_rate]
+
+            soln = solve_ivp(sitebal_static, (0, t_end), theta0_static,
+                             t_eval=t_eval, method='BDF', atol = a_tol, rtol = r_tol)
+
+            r0_vals = np.array([rates_r0_static(theta, GHad, mechanism_str)
+                                for theta in soln.y.T])
+            rV_vals = r0_vals[:, 0]
+            rT_vals = r0_vals[:, 1]
+            rH_vals = r0_vals[:, 2]
+
+            curr_static = rV_vals * -F * 1000  # mA/cm²
+            average_rV_static = np.average(rV_vals)
+            average_rT_static = np.average(rT_vals)
+            average_rH_static = np.average(rH_vals)
+
+            thetaA_H = soln.y[1, :]
+            avg_thetaH = np.average(thetaA_H[5:])
+            print(f'Mechanism {mechanism_str}, GHad = {GHad_eV:.3f} eV → Average Coverage: {avg_thetaH:.3f}')
+
+            if mechanism_str == "VT":
+                print(f"Average rT for {GHad_eV}:", average_rT_static)
+                static_results_VT_rT.append((GHad_eV, average_rT_static))
+                static_results_VT_rV.append((GHad_eV, average_rV_static))
+                static_summary_rows.append({
+                    "Mechanism": "VT",
+                    "GHad (eV)": GHad_eV,
+                    "Average r_T (mol/cm²·s)": average_rT_static,
+                    "Average r_H (mol/cm²·s)": 0.0,
+                    "Average rV (mA/cm²)": average_rV_static
+                })
+            else:
+                print(f"Average rH for {GHad_eV}:", average_rH_static)
+                static_results_VH_rH.append((GHad_eV, average_rH_static))
+                static_results_VH_rV.append((GHad_eV, average_rV_static))
+                static_summary_rows.append({
+                    "Mechanism": "VH",
+                    "GHad (eV)": GHad_eV,
+                    "Average r_T (mol/cm²·s)": 0.0,
+                    "Average r_H (mol/cm²·s)": average_rH_static,
+                    "Average rV (mA/cm²)": average_rV_static
+                })
+
+    if static_results_VH_rH:
+        max_ghad_value, max_rH_value = max(static_results_VH_rH, key=lambda x:x[1])
+        max_static_VH_rH = max_rH_value
+    if static_results_VT_rT:
+        max_ghad_value, max_rT_value = max(static_results_VT_rT, key=lambda x:x[1])
+        max_static_VT_rT = max_rT_value        
+    if static_results_VH_rV:
+        max_ghad_value, max_rH_rV = max(static_results_VH_rV, key=lambda x:x[1])
+        max_static_VH_rV = max_rH_rV
+    if static_results_VT_rV:
+        max_ghad_value, max_rT_rV = max(static_results_VT_rV, key=lambda x:x[1])
+        max_static_VT_rV = max_rT_rV
+    # =======================
+    # ==== PLOTTING VT ======
+    # =======================
+    if static_results_VT_rT:
+        GHad_vals, avg_rT_vals = zip(*static_results_VT_rT)
+        # use VT overlays + last maxstep
+        dynamic_overlay_by_freq = overlay_storage["VT"]["rT"]
+        dynamic_overlay_by_freq1 = overlay_storage["VT"]["rV"]
+        maxstep_VT = last_maxstep_per_mech["VT"] if last_maxstep_per_mech["VT"] is not None else 0.0
+
+        # Volcano plot (rT)
+        plt.figure(figsize=(10, 8))
+        plt.plot(GHad_vals, avg_rT_vals, label='Static GHad Scan', marker='o', color="blue")
+        plt.axhline(y=max_static_VT_rT, color="red", linestyle="--", linewidth=2, label=f"Max Static rT = {max_static_VT_rT:.2e}")
+
+        if dynamic_overlay_by_freq:
+            freq_markers = {
+                freq_phys[0]: "D",
+                freq_phys[1]: "^",
+                freq_phys[2]: "*",
+                freq_phys[3]: "X"
+            }
+            freq_colors = {
+                freq_phys[0]: "red",
+                freq_phys[1]: "tab:orange",
+                freq_phys[2]: "blue",
+                freq_phys[3]: "green"
+            }
+
+            for f in freq_phys:
+                if f not in dynamic_overlay_by_freq:
+                    continue
+                pts = dynamic_overlay_by_freq[f]
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+
+                # scatter markers
+                plt.scatter(xs, ys,
+                            marker=freq_markers.get(f, "x"),
+                            s=120,
+                            facecolors="none",
+                            edgecolors=freq_colors.get(f, None),
+                            linewidths=2,
+                            zorder=3)
+
+                # inline text labels
+                for x, y in zip(xs, ys):
+                    plt.text(
+                        x, y,
+                        f"{f:.2e} Hz",  # label like original
+                        fontsize=16, weight="bold",
+                        color=freq_colors.get(f, "black"),
+                        ha="left", va="bottom",
+                        bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=1)
+                    )
+        plt.legend()
+        plt.xlabel("GHad (eV)")
+        plt.ylabel("Average $\\mathbf{r_T}$ (mol/cm²·s)")
+        plt.title(f"$\\mathbf{{r_T}}$ vs GHad, V = {V_app} V, \nDuty = {duty}, phi = {phi}")
+        ax = plt.gca()
+        ax.xaxis.set_major_locator(MultipleLocator(0.05))
+        plt.tight_layout()
+        plt.show()
+
+        # Volcano plot (rV) for VT
+        if static_results_VT_rV:
+            GHad_vals_rV, avg_rV_vals_VT = zip(*static_results_VT_rV)
+            plt.figure(figsize=(10, 8))
+            plt.plot(GHad_vals_rV, avg_rV_vals_VT,
+                     label='Static GHad Scan', marker='o', color="blue")
+            plt.axhline(y=max_static_VT_rV, color="red", linestyle="--", linewidth=2, label=f"Max Static rV = {max_static_VT_rV:.2e}")
+
+            if dynamic_overlay_by_freq1:
+                freq_markers = {
+                    freq_phys[0]: "D",
+                    freq_phys[1]: "^",
+                    freq_phys[2]: "*",
+                    freq_phys[3]: "X"
+                }
+                freq_colors = {
+                    freq_phys[0]: "red",
+                    freq_phys[1]: "tab:orange",
+                    freq_phys[2]: "blue",
+                    freq_phys[3]: "green"
+                }
+
+                for f in freq_phys:
+                    if f not in dynamic_overlay_by_freq1:
+                        continue
+                    pts = dynamic_overlay_by_freq1[f]
+                    xs = [p[0] for p in pts]  # GHad (eV)
+                    ys = [p[1] for p in pts]  # rV
+
+                    plt.scatter(xs, ys,
+                                marker=freq_markers.get(f, "x"),
+                                s=120,
+                                facecolors="none",
+                                edgecolors=freq_colors.get(f, None),
+                                linewidths=2,
+                                zorder=3)
+
+                    for x, y in zip(xs, ys):
+                        plt.text(
+                            x, y,
+                            f"{f:.2e} Hz",
+                            fontsize=16, weight="bold",
+                            color=freq_colors.get(f, "black"),
+                            ha="left", va="bottom",
+                            bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=1)
+                        )
+            plt.legend()
+            plt.xlabel("GHad (eV)")
+            plt.ylabel("Average rV (mol/cm² s)")
+            plt.title(f"Average rV vs GHad, \nV = {V_app} V (VT), Duty = {duty}, phi = {phi}")
+            ax = plt.gca()
+            ax.xaxis.set_major_locator(MultipleLocator(0.05))
+            plt.tight_layout()
+            plt.show()
+
+    # =======================
+    # ==== PLOTTING VH ======
+    # =======================
+    if static_results_VH_rH:
+        GHad_vals, avg_rH_vals = zip(*static_results_VH_rH)
+        dynamic_overlay_by_freq_rH = overlay_storage["VH"]["rH"]
+        dynamic_overlay_by_freq1_VH = overlay_storage["VH"]["rV"]
+        maxstep_VH = last_maxstep_per_mech["VH"] if last_maxstep_per_mech["VH"] is not None else 0.0
+
+        # ============================
+        # VH rH Volcano Plot
+        # ============================
+        plt.figure(figsize=(10, 8))
+        plt.plot(GHad_vals, avg_rH_vals, label='Static GHad Scan', marker='o', color="blue")
+        plt.axhline(y=max_static_VH_rH, color="red", linestyle="--", linewidth=2, label=f"Max Static rH = {average_rH_static:.2e}")
+
+        if dynamic_overlay_by_freq_rH:
+            freq_markers = {
+                freq_phys[0]: "D",
+                freq_phys[1]: "^",
+                freq_phys[2]: "*",
+                freq_phys[3]: "X"
+            }
+            freq_colors = {
+                freq_phys[0]: "red",
+                freq_phys[1]: "tab:orange",
+                freq_phys[2]: "blue",
+                freq_phys[3]: "green"
+            }
+
+            for f in freq_phys:
+                if f not in dynamic_overlay_by_freq_rH:
+                    continue
+
+                pts = dynamic_overlay_by_freq_rH[f]
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+
+                plt.scatter(xs, ys,
+                            marker=freq_markers.get(f, "x"),
+                            s=120,
+                            facecolors="none",
+                            edgecolors=freq_colors.get(f, None),
+                            linewidths=2,
+                            zorder=3)
+                for x, y in zip(xs, ys):
+                    plt.text(
+                        x, y,
+                        f"{f:.2e} Hz",
+                        fontsize=16, weight="bold",
+                        color=freq_colors.get(f, "black"),
+                        ha="left", va="bottom",
+                        bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=1)
+                    )
+        plt.legend()
+        plt.xlabel("GHad (eV)")
+        plt.ylabel("Average $\\mathbf{r_H}$ (mol/cm²·s)")
+        plt.title(f"Average $\\mathbf{{r_H}}$ vs GHad, V = {V_app} V, \nDuty = {duty}, phi = {phi}")
+        ax = plt.gca()
+        ax.xaxis.set_major_locator(MultipleLocator(0.05))
+        plt.tight_layout()
+        plt.show()
+
+        # ============================
+        # VH rV Volcano Plot
+        # ============================
+        if static_results_VH_rV:
+            GHad_vals_rV, avg_rV_vals_VH = zip(*static_results_VH_rV)
+
+            plt.figure(figsize=(10, 8))
+            plt.plot(GHad_vals_rV, avg_rV_vals_VH,
+                     label='Static GHad Scan', marker='o', color="blue")
+            plt.axhline(y=max_static_VH_rV, color="red", linestyle="--", linewidth=2, label=f"Max Static Current = {max_static_VH_rV:.2e}")
+
+            if dynamic_overlay_by_freq1_VH:
+                freq_markers = {
+                    freq_phys[0]: "D",
+                    freq_phys[1]: "^",
+                    freq_phys[2]: "*",
+                    freq_phys[3]: "X"
+                }
+                freq_colors = {
+                    freq_phys[0]: "red",
+                    freq_phys[1]: "tab:orange",
+                    freq_phys[2]: "blue",
+                    freq_phys[3]: "green"
+                }
+
+                for f in freq_phys:
+                    if f not in dynamic_overlay_by_freq1_VH:
+                        continue
+
+                    pts = dynamic_overlay_by_freq1_VH[f]
+                    xs = [p[0] for p in pts]
+                    ys = [p[1] for p in pts]
+
+                    plt.scatter(xs, ys,
+                                marker=freq_markers.get(f, "x"),
+                                s=120,
+                                facecolors="none",
+                                edgecolors=freq_colors.get(f, None),
+                                linewidths=2,
+                                zorder=3)
+
+                    for x, y in zip(xs, ys):
+                        plt.text(
+                            x, y,
+                            f"{f:.2e} Hz",
+                            fontsize=16, weight="bold",
+                            color=freq_colors.get(f, "black"),
+                            ha="left", va="bottom",
+                            bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=1)
+                        )
+            plt.legend()
+            plt.xlabel("GHad (eV)")
+            plt.ylabel("Average rV (mol/cm² s)")
+            plt.title(f"Average rV vs GHad, \nV = {V_app} V Duty = {duty}, phi = {phi}")
+            ax = plt.gca()
+            ax.xaxis.set_major_locator(MultipleLocator(0.05))
+            plt.tight_layout()
+            plt.show()
+
+# =============================================================================
+# # ======================== EXCEL EXPORT (ALL TOGETHER) ========================
+# save_folder = r"C:\Users\alexj\OneDrive - Drexel University\School\Research\Python\VTH\Dynamic Simulation Excel Files"
+# output_filename = os.path.join(
+#     save_folder,
+#     make_output_filename(kV=k_V, kT=k_T, kH=k_H,
+#                          freq_phys=freq_phys, beta=beta,
+#                          dGmin=dGmin_dynamic, dGmax=dGmax_dynamic,
+#                          voltage=V_app)
+# )
+# 
+# with pd.ExcelWriter(output_filename, engine="openpyxl") as writer:
+#     # Dynamic sheets
+#     for res in dyn_results:
+#         freq_label = f"{res['freq']:.2e}Hz"
+#         df = pd.DataFrame({
+#             "Time (s)": res["t"],
+#             "GHad (eV)": res["GHad_eV"],
+#             "Current (mA/cm²)": res["rV"],
+#             "r_T (mol/cm²·s)": res["r_T"],
+#             "r_V (mol/cm²·s)": res["rV"],
+#             "θ_H": res["thetaH"]
+#         })
+#         df.to_excel(writer, sheet_name=freq_label[:30], index=False)
+# 
+#     # Static sheets (each GHad)
+#     for label, rT_vals in static_rT_dict.items():
+#         df = pd.DataFrame({"Time (s)": t_eval, "r_T (mol/cm²·s)": rT_vals, "rV (mol/cm²·s)": rV_vals, "rH (mol/cm²·s)": rH_vals})
+#         df.to_excel(writer, sheet_name=f"GHad_{label}"[:31], index=False)
+# 
+#     # All static in one sheet
+#     if static_rT_dict:
+#         df_static_all = pd.DataFrame(static_rT_dict)
+#         df_static_all.insert(0, "Time (s)", t_eval)
+#         df_static_all.to_excel(writer, sheet_name="All_Static", index=False)
+# 
+#     # Summary sheet
+#     if avg_summary:
+#         df_summary = pd.DataFrame(avg_summary)
+#         df_summary.to_excel(writer, sheet_name="Static_Summary", index=False)
+# 
+# print(f"\nAll results exported to Excel: {output_filename}")
+# =============================================================================
+
+######################### VT Freq Sweep Plot ################################
+
+mech_T = "VT"
+
+freqs_T = []
+avg_vals_T = []
+
+for f, d in overlay_storage[mech_T]["avg"].items():
+    freqs_T.append(f)
+    avg_vals_T.append(d["average_rT"])
+
+# Sort by frequency (important for log plots)
+freqs_T = np.array(freqs_T)
+avg_vals_T = np.array(avg_vals_T) / max_rT_value
+order = np.argsort(freqs_T)
+
+freqs_T = freqs_T[order]
+freqs_T_norm = freqs_T / (k_V_RDS / cmax)
+avg_vals_T = avg_vals_T[order]
+
+# Plot
+plt.figure(figsize=(9, 7))
+plt.plot(freqs_T_norm, avg_vals_T, marker='o', linewidth=2)
+ymin_T = avg_vals_T.min()
+ymax_T = avg_vals_T.max()
+
+pad_T = 0.05 * (ymax_T - ymin_T)   # 5% padding
+
+plt.ylim(ymin_T - pad_T, ymax_T + pad_T)
+plt.xscale('log')
+plt.xlabel(r"Normalized frequency  $f\,/\,(k_V/c_{\max})$  (dimensionless)")
+plt.ylabel("Average rT, normalized by \n max static (mol/cm2*s)")
+plt.title(f"Average rT vs Frequency, at V={V_app},\n dG=({dGmin_dynamic},{dGmax_dynamic}), duty={duty} phi = {phi:.2f}")
+plt.grid(True, which="both", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+###################### VT rV Freq Sweep Plot ##############################
+
+mech_T = "VT"
+
+freqs_T = []
+avg_vals_T = []
+
+for f, d in overlay_storage[mech_T]["avg"].items():
+    freqs_T.append(f)
+    avg_vals_T.append(d["average_rV"])
+
+# Sort by frequency (important for log plots)
+freqs_T = np.array(freqs_T)
+avg_vals_T = np.array(avg_vals_T) / max_static_VT_rV
+order = np.argsort(freqs_T)
+
+freqs_T = freqs_T[order]
+avg_vals_T = avg_vals_T[order]
+
+# Plot
+plt.figure(figsize=(9, 7))
+plt.plot(freqs_T_norm, avg_vals_T, marker='o', linewidth=2)
+ymin_T = avg_vals_T.min()
+ymax_T = avg_vals_T.max()
+
+pad_T = 0.05 * (ymax_T - ymin_T)   # 5% padding
+
+plt.ylim(ymin_T - pad_T, ymax_T + pad_T)
+plt.xscale('log')
+plt.xlabel(r"Normalized frequency  $f\,/\,(k_V/c_{\max})$  (dimensionless)")
+plt.ylabel("Average rV, normalized by \n max static rV (mol/cm2*s)")
+plt.title(f"Average rV vs Frequency, at V={V_app},\n dG=({dGmin_dynamic},{dGmax_dynamic}), duty={duty} phi = {phi:.2f}")
+plt.grid(True, which="both", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+############################## VH FREQ SWEEP PLOT ######################################
+
+mech_H = "VH"
+quantity_H = "rH"   # choose: "rT", "rH", or "rV"
+
+freqs_H = []
+avg_vals_H = []
+
+for f, d in overlay_storage[mech_H]["avg"].items():
+    freqs_H.append(f)
+    avg_vals_H.append(d["average_rH"])
+
+# Sort by frequency (important for log plots)
+freqs_H = np.array(freqs_H)
+avg_vals_H = np.array(avg_vals_H) / max_static_VH_rH
+order_H = np.argsort(freqs_H)
+
+freqs_H = freqs_H[order_H]
+freqs_H_norm = freqs_H / (k_V_RDS / cmax)
+avg_vals_H = avg_vals_H[order_H]
+
+# Plot
+plt.figure(figsize=(9, 7))
+plt.plot(freqs_H_norm, avg_vals_H, marker='o', linewidth=2)
+ymin_H = avg_vals_H.min()
+ymax_H = avg_vals_H.max()
+
+pad_H = 0.05 * (ymax_H - ymin_H)   # 5% padding
+
+plt.ylim(ymin_H - pad_H, ymax_H + pad_H)
+plt.xscale('log')
+plt.xlabel(r"Normalized frequency  $f\,/\,(k_V/c_{\max})$  (dimensionless)")
+plt.ylabel("Average rH Normalized by \nMax Static rH (mol/cm2*s)")
+plt.title(f"Average rH vs Frequency, at V={V_app}\n dG=({dGmin_dynamic},{dGmax_dynamic}), duty={duty} phi = {phi:.2f}")
+plt.grid(True, which="both", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+########################### VH rV FREQ SWEEP PLOT ###################################
+
+mech_H = "VH"
+quantity_H = "rV"   # choose: "rT", "rH", or "rV"
+
+freqs_H = []
+avg_vals_H_rV = []
+
+for f, d in overlay_storage[mech_H]["avg"].items():
+    freqs_H.append(f)
+    avg_vals_H_rV.append(d["average_rV"])
+
+# Sort by frequency (important for log plots)
+freqs_H = np.array(freqs_H)
+avg_vals_H_rV = np.array(avg_vals_H_rV) / max_static_VH_rV
+order_H = np.argsort(freqs_H)
+
+freqs_H = freqs_H[order_H]
+avg_vals_H_rV = avg_vals_H_rV[order_H]
+
+# Plot
+plt.figure(figsize=(9, 7))
+plt.plot(freqs_H_norm, avg_vals_H_rV, marker='o', linewidth=2)
+ymin_H_rV = avg_vals_H_rV.min()
+ymax_H_rV = avg_vals_H_rV.max()
+
+pad_H_rV = 0.05 * (ymax_H_rV - ymin_H_rV)   # 5% padding
+
+plt.ylim(ymin_H_rV - pad_H_rV, ymax_H_rV + pad_H_rV)
+plt.xscale('log')
+plt.xlabel(r"Normalized frequency  $f\,/\,(k_V/c_{\max})$  (dimensionless)")
+plt.ylabel("Average rV, Normalized by \nMax Static rV (mol/cm2*s)")
+plt.title(f"Average rV vs Frequency, at V={V_app}\n dG=({dGmin_dynamic},{dGmax_dynamic}), duty={duty} phi = {phi:.2f}")
+plt.grid(True, which="both", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# =============================================================================
+# ################################## COMBINED FREQ SWEEP PLOT ####################################
+# #combined
+# plt.figure(figsize=(9, 7))
+# plt.plot(freqs_H, avg_vals_H, marker='o', linewidth=2, label='Average rH Values')
+# plt.plot(freqs_T, avg_vals_T, marker='o', linewidth=2, label='Average rT Values')
+# #plt.ylim((min(ymin_T, ymin_H) - max(pad_H, pad_T)), (max(ymax_T, ymax_H) + max(pad_H, pad_T)))
+# plt.xscale('log')
+# plt.ylabel('Average Rate (mol/cm2*s)')
+# plt.legend()
+# plt.grid()
+# plt.title(f'Average Rate vs Frequency, at V={V_app}, dGmin={dGmin_dynamic}, dGmax={dGmax_dynamic}')
+# plt.tight_layout()
+# ax = plt.gca()
+# ax.xaxis.set_major_locator(LogLocator(base=10))
+# # =============================================================================
+# # ax.xaxis.set_minor_locator(LogLocator(base=10, subs=[]))
+# # ax.xaxis.set_major_formatter(LogFormatterSciNotation())
+# # ax.set_xlim(freq_phys.min(), freq_phys.max())
+# # =============================================================================
+# plt.show()
+# =============================================================================
+
+# =============================================================================
+# ############################## COMBINED CURRENT FREQ SWEEP PLOT ################################
+# 
+# mech_rV_T = "VT"
+# mech_rV_H = "VH"
+# 
+# quantity_rV_T = "rV"   # choose: "rT", "rH", or "rV"
+# quantity_rV_H = "rV"
+# 
+# freqs_rV_H = []
+# freqs_rV_T = []
+# avg_vals_rV_H = []
+# avg_vals_rV_T = []
+# 
+# for f, pts in overlay_storage[mech_T]["rV"].items():
+#     val_weak = pts[0][1]    # weak binding value
+#     val_strong = pts[1][1]  # strong binding value
+#     avg_val_T = 0.5 * (val_weak + val_strong)
+# 
+#     freqs_rV_T.append(f)
+#     avg_vals_rV_T.append(avg_val_T)
+#     
+# for f, pts in overlay_storage[mech_H]["rV"].items():
+#     val_weak = pts[0][1]    # weak binding value
+#     val_strong = pts[1][1]  # strong binding value
+#     avg_val_H = 0.5 * (val_weak + val_strong)
+# 
+#     freqs_rV_H.append(f)
+#     avg_vals_rV_H.append(avg_val_H)
+# 
+# freqs_rV_T = np.array(freqs_rV_T, dtype=float)
+# avg_vals_rV_T = np.array(avg_vals_rV_T, dtype=float)
+# order_rV_T = np.argsort(freqs_rV_T)
+# freqs_rV_T = freqs_rV_T[order_rV_T]
+# avg_vals_rV_T = avg_vals_rV_T[order_rV_T]
+# 
+# freqs_rV_H = np.array(freqs_rV_H, dtype=float)
+# avg_vals_rV_H = np.array(avg_vals_rV_H, dtype=float)
+# order_rV_H = np.argsort(freqs_rV_H)
+# freqs_rV_H = freqs_rV_H[order_rV_H]
+# avg_vals_rV_H = avg_vals_rV_H[order_rV_H]
+# 
+# # Plot
+# plt.figure(figsize=(9, 7))
+# plt.plot(freqs_rV_T, avg_vals_rV_T, marker='o', linewidth=2)
+# plt.plot(freqs_rV_H, avg_vals_rV_H, marker='o', linewidth=2)
+# 
+# if avg_vals_rV_T.min() < avg_vals_rV_H.min():
+#     ymin_rV = avg_vals_rV_T.min()
+# else:
+#     ymin_rV = avg_vals_rV_H.min()
+#     
+# if avg_vals_rV_T.max() > avg_vals_rV_H.max():
+#     ymax_rV = avg_vals_rV_T.max()
+# else:
+#     ymax_rV = avg_vals_rV_H.max()
+# 
+# pad_rV = 0.05 * (ymax_rV - ymin_rV)   # 5% padding
+# 
+# plt.ylim(ymax_rV - pad_rV, ymax_rV + pad_rV)
+# plt.xscale('log')
+# plt.xlabel("Frequency (Hz) / kV")
+# plt.ylabel("Average rT (mol/cm2*s)")
+# plt.title(f"Average rT vs Frequency, at V={V_app},\n dGmin={dGmin_dynamic}, dGmax={dGmax_dynamic}, phi = {phi:.2f}")
+# plt.grid(True, which="both", alpha=0.3)
+# plt.tight_layout()
+# plt.show()
+# =============================================================================

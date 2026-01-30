@@ -144,8 +144,8 @@ dGmin_eV = 0.0  # eV
 dGmax_eV = 0.20   # eV
 
 # dG values, dynamic volcano
-dGmin_dynamic = 0.05  # eV
-dGmax_dynamic = 0.15  # eV
+dGmin_dynamic = 0.09  # eV
+dGmax_dynamic = 0.16  # eV
 
 # === Prompt User ===
 print("Choose which simulations to run:")
