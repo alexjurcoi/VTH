@@ -103,7 +103,7 @@ V_app = -0.1
 k = 95
 a_tol = 1e-14
 r_tol = 1e-8
-phi = -np.pi/2
+phi = -3*np.pi/2
 duty = 0.5   #0.5 is 50/50 split, 0.1 -> majority dGmin | 0.9 -> majority dGmax
 cycles_to_run = 1e3
 
